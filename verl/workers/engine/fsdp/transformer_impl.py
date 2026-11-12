@@ -1096,17 +1096,26 @@ class FSDPEngine(BaseEngine):
         if callable(disable_adapter):
             return disable_adapter()
 
-        disable_adapters = getattr(self.module, "disable_adapters", None)
-        enable_adapters = getattr(self.module, "enable_adapters", None)
-        if callable(disable_adapters) and callable(enable_adapters):
+        from peft.tuners.tuners_utils import BaseTunerLayer
+        from peft.utils import ModulesToSaveWrapper
+
+        adapter_modules = [
+            module
+            for module in self.module.modules()
+            if isinstance(module, (BaseTunerLayer, ModulesToSaveWrapper))
+        ]
+        if adapter_modules:
 
             @contextmanager
             def disable_transformers_adapters():
-                disable_adapters()
+                previous_states = [not bool(module.disable_adapters) for module in adapter_modules]
+                for module in adapter_modules:
+                    module.enable_adapters(enabled=False)
                 try:
                     yield
                 finally:
-                    enable_adapters()
+                    for module, was_enabled in zip(adapter_modules, previous_states, strict=True):
+                        module.enable_adapters(enabled=was_enabled)
 
             return disable_transformers_adapters()
 
