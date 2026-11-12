@@ -1092,7 +1092,25 @@ class FSDPEngine(BaseEngine):
             log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
     def disable_adapter(self) -> ContextManager:
-        return self.module.disable_adapter()
+        disable_adapter = getattr(self.module, "disable_adapter", None)
+        if callable(disable_adapter):
+            return disable_adapter()
+
+        disable_adapters = getattr(self.module, "disable_adapters", None)
+        enable_adapters = getattr(self.module, "enable_adapters", None)
+        if callable(disable_adapters) and callable(enable_adapters):
+
+            @contextmanager
+            def disable_transformers_adapters():
+                disable_adapters()
+                try:
+                    yield
+                finally:
+                    enable_adapters()
+
+            return disable_transformers_adapters()
+
+        return nullcontext()
 
 
 class EngineEvalModeCtx(BaseEngineCtx):
