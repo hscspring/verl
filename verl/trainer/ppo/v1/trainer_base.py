@@ -447,6 +447,17 @@ class PPOTrainer(ABC):
                 self._shutdown_dump_executor()
                 return
 
+        stop_after_global_step = self.config.trainer.get("stop_after_global_step")
+        if stop_after_global_step is not None:
+            if isinstance(stop_after_global_step, bool) or not isinstance(stop_after_global_step, int):
+                raise TypeError("trainer.stop_after_global_step must be an integer")
+            if not self.global_steps < stop_after_global_step <= self.total_training_steps:
+                raise ValueError(
+                    "trainer.stop_after_global_step must be greater than the resumed global step "
+                    "and no greater than trainer.total_training_steps"
+                )
+            logger.info(f"Training segment will stop after global step {stop_after_global_step}")
+
         current_epoch = self.global_steps // self.steps_per_epoch
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
@@ -465,7 +476,9 @@ class PPOTrainer(ABC):
         self.on_train_begin()
         last_val_metrics = None
         while current_epoch < self.config.trainer.total_epochs and self.global_steps <= self.total_training_steps:
-            is_last_step = self.global_steps >= self.total_training_steps
+            is_last_step = self.global_steps >= self.total_training_steps or (
+                stop_after_global_step is not None and self.global_steps >= stop_after_global_step
+            )
             metrics = {}
             self.timing_raw = {}
 
@@ -1742,13 +1755,21 @@ class PPOTrainer(ABC):
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
+        turn_reward_keys = self._turn_reward_component_keys(self.config.algorithm)
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        if turn_reward_keys:
+            fields.append("extra_fields")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        turn_rewards = self._extract_reward_extra_info(
+            data.pop("extra_fields", None),
+            turn_reward_keys,
+        )
 
         response_mask = data["response_mask"]
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
+        data.non_tensor_batch.update(turn_rewards)
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
@@ -1800,6 +1821,37 @@ class PPOTrainer(ABC):
         batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
 
         return batch
+
+    @staticmethod
+    def _turn_reward_component_keys(config: Any) -> list[str]:
+        keys = list(config.get("turn_reward_keys") or [])
+        keys.extend(
+            config.get(name)
+            for name in (
+                "turn_language_gate_key",
+                "turn_boundary_violation_key",
+                "turn_platform_refusal_key",
+            )
+        )
+        return list(dict.fromkeys(key for key in keys if key))
+
+    @staticmethod
+    def _extract_reward_extra_info(extra_fields: Any, keys: list[str]) -> dict[str, np.ndarray]:
+        if not keys:
+            return {}
+        if extra_fields is None:
+            raise KeyError("turn rewards require extra_fields.reward_extra_info")
+        rows = extra_fields.tolist()
+        components: dict[str, list[Any]] = {key: [] for key in keys}
+        for row_index, row in enumerate(rows):
+            reward_extra_info = row.get("reward_extra_info") if isinstance(row, dict) else None
+            if not isinstance(reward_extra_info, dict):
+                raise KeyError(f"row {row_index} is missing extra_fields.reward_extra_info")
+            for key in keys:
+                if key not in reward_extra_info:
+                    raise KeyError(f"row {row_index} is missing turn reward key {key!r}")
+                components[key].append(reward_extra_info[key])
+        return {key: np.asarray(values, dtype=object) for key, values in components.items()}
 
     def _update_critic(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the critic network."""
