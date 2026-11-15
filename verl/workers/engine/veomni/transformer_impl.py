@@ -37,6 +37,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import fsdp_version
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import convert_weight_keys
 from verl.utils.profiler import log_gpu_memory_usage
 from verl.utils.ulysses import (
@@ -621,6 +622,14 @@ class VeOmniEngine(FSDPEngine):
 
         if self._is_offload_optimizer:
             offload_veomni_optimizer(self.optimizer)
+
+        # Restoring optimizer state materializes it on the accelerator. Offloading
+        # the tensors releases their allocations to PyTorch's caching allocator,
+        # but colocated rollout workers cannot reclaim that memory until the cache
+        # itself is returned to CUDA. Fresh runs do not hit this path because their
+        # optimizer state starts empty.
+        aggressive_empty_cache(force_sync=True)
+        log_gpu_memory_usage("After offload model/optimizer during checkpoint load", logger=logger)
 
     def get_per_tensor_param_shard(self, **kwargs):
         """Yield each rank's *local* shard ``(name, local_shard, ShardSpec)`` -- the
